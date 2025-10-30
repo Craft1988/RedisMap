@@ -11,7 +11,16 @@ import redis.clients.jedis.Pipeline;
 import redis.clients.jedis.Response;
 
 import java.io.IOException;
-import java.util.*;
+import java.util.AbstractMap;
+import java.util.ArrayList;
+import java.util.Collection;
+import java.util.Collections;
+import java.util.HashSet;
+import java.util.LinkedHashMap;
+import java.util.List;
+import java.util.Map;
+import java.util.Objects;
+import java.util.Set;
 
 public class RedisWrapperMap<K, V> implements Map<K, V>, AutoCloseable {
     private static final Logger LOG = LoggerFactory.getLogger(RedisWrapperMap.class);
@@ -113,7 +122,7 @@ public class RedisWrapperMap<K, V> implements Map<K, V>, AutoCloseable {
     }
 
     @Override
-    public void close() throws Exception {
+    public void close() {
         LOG.info("Closing JedisPool for prefix='{}'", prefix);
         jedisPool.close();
         LOG.info("JedisPool closed for prefix='{}'", prefix);
