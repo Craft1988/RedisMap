@@ -5,7 +5,9 @@ import com.fasterxml.jackson.databind.ObjectMapper;
 import org.redis.util.LogHelper;
 import org.slf4j.Logger;
 import org.slf4j.LoggerFactory;
+import redis.clients.jedis.Jedis;
 import redis.clients.jedis.JedisPool;
+import redis.clients.jedis.Pipeline;
 
 import java.io.IOException;
 import java.util.*;
@@ -136,17 +138,85 @@ public class RedisWrapperMap<K, V> implements Map<K, V>, AutoCloseable {
 
     @Override
     public V get(Object o) {
-        return null;
+        @SuppressWarnings("unchecked")
+        String serializedKey = serializeKey((K) o);
+        String redisKey = keyForRedisString(serializedKey);
+        long t0 = System.nanoTime();
+        try (Jedis jedis = jedisPool.getResource()) {
+            String value = jedis.get(redisKey);
+            if (value == null) {
+                LOG.info("Get: MISS key='{}', redisKey='{}'", LogHelper.safeToString(o), redisKey);
+                return null;
+            }
+            V val = deserializeValue(value);
+            LOG.info("Get: HIT key='{}' -> valueType='{}', redisKey='{}'",
+                    LogHelper.safeToString(o),
+                    val != null ? val.getClass().getName() : "null", redisKey);
+            LOG.debug("Get latencyMicros={}, valueJsonLength={}", (System.nanoTime() - t0) / 1_000, value.length());
+            return val;
+        } catch (Exception e) {
+            LOG.error("Get failed: key='{}', redisKey='{}'", LogHelper.safeToString(o), redisKey, e);
+            throw e;
+        }
     }
 
     @Override
-    public V put(K k, V v) {
-        return null;
+    public V put(K key, V value) {
+        String serializedKey = serializeKey(key);
+        String serializedValue = serializeValue(value);
+        String redisKey = keyForRedisString(serializedKey);
+        long t0 = System.nanoTime();
+
+        try (Jedis jedis = jedisPool.getResource()) {
+            String prev = jedis.get(redisKey);
+            Pipeline pipeline = jedis.pipelined();
+            pipeline.set(redisKey, serializedValue);
+            pipeline.sadd(keysSetKey, serializedKey);
+            pipeline.sync();
+            LOG.info("Put: keyType='{}', valueType='{}', redisKey='{}', keysSetKey='{}'",
+                    key.getClass().getName(),
+                    value.getClass().getName(),
+                    redisKey, keysSetKey);
+            LOG.debug("Put latencyMicros={}, prevExists={}", (System.nanoTime() - t0) / 1_000, prev != null);
+
+            if (prev == null) return null;
+
+            return deserializeValue(prev);
+
+        } catch (Exception e) {
+            LOG.error("Put failed: key='{}', redisKey='{}'",
+                    LogHelper.safeToString(key),
+                    redisKey, e);
+            throw e;
+        }
     }
 
     @Override
-    public V remove(Object o) {
-        return null;
+    public V remove(Object key) {
+        @SuppressWarnings("unchecked")
+        String sk = serializeKey((K) key);
+        String redisKeyForSerializedKey = keyForRedisString(sk);
+        long t0 = System.nanoTime();
+
+        try (Jedis jedis = jedisPool.getResource()) {
+            String prev = jedis.get(redisKeyForSerializedKey);
+            Pipeline pipeline = jedis.pipelined();
+            pipeline.del(redisKeyForSerializedKey);
+            pipeline.srem(keysSetKey, sk);
+            pipeline.sync();
+            LOG.info("Remove: key='{}', redisKey='{}', removedFromSet='{}'",
+                    LogHelper.safeToString(key),
+                    redisKeyForSerializedKey, keysSetKey);
+            LOG.debug("Remove latencyMicros={}, hadPrev={}", (System.nanoTime() - t0) / 1_000, prev != null);
+
+            if (prev == null) return null;
+            return deserializeValue(prev);
+        } catch (Exception e) {
+            LOG.error("Remove failed: key='{}', redisKey='{}'",
+                    LogHelper.safeToString(key),
+                    redisKeyForSerializedKey, e);
+            throw e;
+        }
     }
 
     @Override
@@ -156,7 +226,29 @@ public class RedisWrapperMap<K, V> implements Map<K, V>, AutoCloseable {
 
     @Override
     public void clear() {
-
+        long t0 = System.nanoTime();
+        try (Jedis jedis = jedisPool.getResource()) {
+            Set<String> allSerializedKeys = jedis.smembers(keysSetKey);
+            LOG.info("Clear: keysSetKey='{}', keysCount={}", keysSetKey, allSerializedKeys.size());
+            if (!allSerializedKeys.isEmpty()) {
+                Pipeline pipeline = jedis.pipelined();
+                int ops = 0;
+                for (String sk : allSerializedKeys) {
+                    pipeline.del(keyForRedisString(sk));
+                    ops++;
+                }
+                pipeline.del(keysSetKey);
+                ops++;
+                pipeline.sync();
+                LOG.debug("Clear: pipelineOps={}, latencyMicros={}", ops, (System.nanoTime() - t0) / 1_000);
+            } else {
+                jedis.del(keysSetKey);
+                LOG.debug("Clear: keysSetKey deleted (was already empty)");
+            }
+        } catch (Exception e) {
+            LOG.error("Clear failed: keysSetKey='{}'", keysSetKey, e);
+            throw e;
+        }
     }
 
     @Override
