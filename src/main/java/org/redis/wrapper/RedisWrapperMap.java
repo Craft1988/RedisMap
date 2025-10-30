@@ -280,8 +280,29 @@ public class RedisWrapperMap<K, V> implements Map<K, V>, AutoCloseable {
     }
 
     @Override
-    public void putAll(Map<? extends K, ? extends V> map) {
-
+    public void putAll(Map<? extends K, ? extends V> another) {
+        if (another.isEmpty()) {
+            LOG.info("PutAll: empty map -> no-op");
+            return;
+        }
+        long t0 = System.nanoTime();
+        try (Jedis jedis = jedisPool.getResource()) {
+            Pipeline pipeline = jedis.pipelined();
+            int count = 0;
+            for (Entry<? extends K, ? extends V> e : another.entrySet()) {
+                String sk = serializeKey(e.getKey());
+                String sv = serializeValue(e.getValue());
+                pipeline.set(keyForRedisString(sk), sv);
+                pipeline.sadd(keysSetKey, sk);
+                count++;
+            }
+            pipeline.sync();
+            LOG.info("PutAll: entries={}, keysSetKey='{}'", count, keysSetKey);
+            LOG.debug("PutAll latencyMicros={}, pipelineOps={}", (System.nanoTime() - t0) / 1_000, count * 2);
+        } catch (Exception e) {
+            LOG.error("PutAll failed: entries={}", another.size(), e);
+            throw e;
+        }
     }
 
     @Override
@@ -404,5 +425,18 @@ public class RedisWrapperMap<K, V> implements Map<K, V>, AutoCloseable {
             LOG.error("EntrySet failed: keysSetKey='{}'", keysSetKey, e);
             throw e;
         }
+    }
+
+    @Override
+    public boolean equals(Object o) {
+        if (this == o) return true;
+        if (!(o instanceof Map)) return false;
+        Map<?, ?> other = (Map<?, ?>) o;
+        return this.entrySet().equals(other.entrySet());
+    }
+
+    @Override
+    public int hashCode() {
+        return entrySet().hashCode();
     }
 }
