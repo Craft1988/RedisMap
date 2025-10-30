@@ -22,6 +22,27 @@ import java.util.Map;
 import java.util.Objects;
 import java.util.Set;
 
+/**
+ * Обёртка над Redis, реализующая интерфейс {@link Map}, с сериализацией ключей и значений в JSON.
+ *
+ * <p>Ключи и значения сериализуются с помощью {@link ObjectMapper} и хранятся в Redis как строки.
+ * Для отслеживания всех ключей используется отдельное множество Redis ({@code keysSetKey}),
+ * что позволяет реализовать методы {@code keySet()}, {@code values()},
+ * {@code entrySet()} и {@code size()}.</p>
+ *
+ * <p>Ключи и значения сериализуются при записи и десериализуются при чтении. Типы {@code K} и {@code V}
+ * определяются во время выполнения на основе переданных объектов. Все операции логируются с указанием
+ * задержек и подробностей сериализации.</p>
+ *
+ * <p>Класс потокобезопасен при условии, что {@link JedisPool} не передаётся между потоками напрямую.</p>
+ *
+ * @param <K> тип ключей
+ * @param <V> тип значений
+ *
+ * @see Map
+ * @see JedisPool
+ * @see ObjectMapper
+ */
 public class RedisWrapperMap<K, V> implements Map<K, V>, AutoCloseable {
     private static final Logger LOG = LoggerFactory.getLogger(RedisWrapperMap.class);
     private final JedisPool jedisPool;
@@ -39,6 +60,15 @@ public class RedisWrapperMap<K, V> implements Map<K, V>, AutoCloseable {
         LOG.info("Initialized RedisWrapperMap: prefix='{}', keysSetKey='{}'", this.prefix, this.keysSetKey);
     }
 
+    /**
+     * Формирует Redis-ключ для уже сериализованного ключа.
+     *
+     * <p>Комбинирует поле {@code prefix} с литералом {@code "entry"} и
+     * переданной сериализованной строкой ключа, возвращая итоговый ключ для хранения в Redis(String).</p>
+     *
+     * @param key сериализованная строка ключа (не должна быть null)
+     * @return итоговый Redis-ключ в формате {@code prefix + ":entry:" + key}
+     */
     private String keyForRedisString(String key) {
         String redisKey = prefix + ":entry:" + key;
         if (LOG.isTraceEnabled()) {
@@ -47,6 +77,17 @@ public class RedisWrapperMap<K, V> implements Map<K, V>, AutoCloseable {
         return redisKey;
     }
 
+    /**
+     * Сериализует объект-ключ в JSON и сохраняет его runtime-класс в {@code keyType}.
+     *
+     * <p>Использует {@code objectMapper} для преобразования объекта в JSON.
+     * Логирует информацию о сериализации на уровне DEBUG и пробрасывает ошибки как
+     * непроверяемые исключения.</p>
+     *
+     * @param key объект-ключ для сериализации;
+     * @return JSON-представление ключа
+     * @throws RuntimeException если сериализация в JSON завершилась неудачей
+     */
     private String serializeKey(K key) {
         keyType = (Class<K>) key.getClass();
         long t0 = System.nanoTime();
@@ -64,6 +105,17 @@ public class RedisWrapperMap<K, V> implements Map<K, V>, AutoCloseable {
         }
     }
 
+    /**
+     * Сериализует объект-значение в JSON и сохраняет его runtime-класс в {@code valueType}.
+     *
+     * <p>Использует {@code objectMapper} для преобразования объекта в JSON.
+     * Логирует информацию о сериализации на уровне DEBUG и пробрасывает ошибки как
+     * непроверяемые исключения.</p>
+     *
+     * @param value объект-значение для сериализации; не должен быть null
+     * @return JSON-представление значения
+     * @throws RuntimeException если сериализация в JSON завершилась неудачей
+     */
     private String serializeValue(V value) {
         valueType = (Class<V>) value.getClass();
         long t0 = System.nanoTime();
@@ -83,6 +135,17 @@ public class RedisWrapperMap<K, V> implements Map<K, V>, AutoCloseable {
         }
     }
 
+    /**
+     * Десериализует JSON-строку в объект значения типа, сохранённого в {@code valueType}.
+     *
+     * <p>Если {@code json} равен {@code null}, возвращает {@code null}. Использует
+     * {@code objectMapper} для чтения JSON в тип {@code valueType}. Логирует время
+     * выполнения на уровне TRACE и пробрасывает ошибки как непроверяемые исключения.</p>
+     *
+     * @param json JSON-строка, представляющая значение, или {@code null}
+     * @return десериализованное значение типа {@code V}, либо {@code null} если вход равен {@code null}
+     * @throws RuntimeException если десериализация JSON завершилась неудачей
+     */
     private V deserializeValue(String json) {
         if (json == null) return null;
         long t0 = System.nanoTime();
@@ -102,6 +165,17 @@ public class RedisWrapperMap<K, V> implements Map<K, V>, AutoCloseable {
         }
     }
 
+    /**
+     * Десериализует JSON-строку в объект ключа типа, сохранённого в {@code keyType}.
+     *
+     * <p>Если {@code json} равен {@code null}, возвращает {@code null}. Использует
+     * {@code objectMapper} для чтения JSON в тип {@code keyType}. Логирует время
+     * выполнения на уровне TRACE и пробрасывает ошибки как непроверяемые исключения.</p>
+     *
+     * @param json JSON-строка, представляющая ключ, или {@code null}
+     * @return десериализованный ключ типа {@code K}, либо {@code null} если вход равен {@code null}
+     * @throws RuntimeException если десериализация JSON завершилась неудачей
+     */
     private K deserializeKey(String json) {
         if (json == null) return null;
         long t0 = System.nanoTime();
@@ -121,6 +195,12 @@ public class RedisWrapperMap<K, V> implements Map<K, V>, AutoCloseable {
         }
     }
 
+    /**
+     * Закрывает пул соединений Jedis.
+     *
+     * <p>Вызывается при завершении работы компонента, освобождая ресурсы Redis.</p>
+     * <p>Логирует начало и завершение закрытия пула.</p>
+     */
     @Override
     public void close() {
         LOG.info("Closing JedisPool for prefix='{}'", prefix);
@@ -128,6 +208,15 @@ public class RedisWrapperMap<K, V> implements Map<K, V>, AutoCloseable {
         LOG.info("JedisPool closed for prefix='{}'", prefix);
     }
 
+    /**
+     * Возвращает количество элементов в хранилище.
+     *
+     * <p>Измеряет размер множества ключей {@code keysSetKey} в Redis с помощью команды {@code SCARD}.</p>
+     * <p>Логирует результат и задержку выполнения.</p>
+     *
+     * @return количество элементов в хранилище
+     * @throws RuntimeException если операция Redis завершилась ошибкой
+     */
     @Override
     public int size() {
         long t0 = System.nanoTime();
@@ -143,6 +232,13 @@ public class RedisWrapperMap<K, V> implements Map<K, V>, AutoCloseable {
         }
     }
 
+    /**
+     * Проверяет, пусто ли хранилище.
+     *
+     * <p>Вызывает {@link #size()} и сравнивает результат с нулём.</p>
+     *
+     * @return {@code true}, если хранилище пусто; иначе {@code false}
+     */
     @Override
     public boolean isEmpty() {
         boolean empty = size() == 0;
@@ -150,6 +246,16 @@ public class RedisWrapperMap<K, V> implements Map<K, V>, AutoCloseable {
         return empty;
     }
 
+    /**
+     * Проверяет наличие указанного ключа в хранилище.
+     *
+     * <p>Сериализует ключ и проверяет его наличие в множестве {@code keysSetKey} с помощью {@code SISMEMBER}.</p>
+     * <p>Логирует входные данные, результат и задержку выполнения.</p>
+     *
+     * @param key ключ для проверки
+     * @return {@code true}, если ключ присутствует; иначе {@code false}
+     * @throws RuntimeException если операция Redis завершилась ошибкой
+     */
     @Override
     public boolean containsKey(Object key) {
         @SuppressWarnings("unchecked")
@@ -166,6 +272,18 @@ public class RedisWrapperMap<K, V> implements Map<K, V>, AutoCloseable {
         }
     }
 
+    /**
+     * Проверяет наличие указанного значения в хранилище.
+     *
+     * <p>Сериализует значение и сравнивает его с каждым сохранённым значением
+     * по всем ключам из {@code keysSetKey}.</p>
+     * <p>Использует Redis Pipeline для параллельного получения значений.
+     * Логирует размер множества, результат и задержку.</p>
+     *
+     * @param value значение для проверки
+     * @return {@code true}, если значение найдено; иначе {@code false}
+     * @throws RuntimeException если операция Redis завершилась ошибкой
+     */
     @Override
     public boolean containsValue(Object value) {
         @SuppressWarnings("unchecked")
@@ -205,6 +323,17 @@ public class RedisWrapperMap<K, V> implements Map<K, V>, AutoCloseable {
         }
     }
 
+    /**
+     * Получает значение, связанное с указанным ключом.
+     *
+     * <p>Сериализует ключ, формирует Redis-ключ и извлекает значение из Redis.
+     * В случае отсутствия значения возвращает {@code null}. При наличии — десериализует
+     * и возвращает объект типа {@code V}. Логирует попадание/промах и задержку выполнения.</p>
+     *
+     * @param o ключ, по которому производится поиск
+     * @return значение, связанное с ключом, либо {@code null}, если оно отсутствует
+     * @throws RuntimeException если операция Redis завершилась ошибкой
+     */
     @Override
     public V get(Object o) {
         @SuppressWarnings("unchecked")
@@ -229,6 +358,18 @@ public class RedisWrapperMap<K, V> implements Map<K, V>, AutoCloseable {
         }
     }
 
+    /**
+     * Сохраняет значение по указанному ключу.
+     *
+     * <p>Сериализует ключ и значение, сохраняет их в Redis с помощью Pipeline.
+     * Добавляет ключ в множество {@code keysSetKey}. Возвращает предыдущее значение,
+     * если оно существовало, иначе {@code null}. Логирует типы, ключи и задержку.</p>
+     *
+     * @param key   ключ, по которому сохраняется значение
+     * @param value значение для сохранения
+     * @return предыдущее значение, если оно было, иначе {@code null}
+     * @throws RuntimeException если операция Redis завершилась ошибкой
+     */
     @Override
     public V put(K key, V value) {
         String serializedKey = serializeKey(key);
@@ -260,6 +401,16 @@ public class RedisWrapperMap<K, V> implements Map<K, V>, AutoCloseable {
         }
     }
 
+    /**
+     * Удаляет значение, связанное с указанным ключом.
+     *
+     * <p>Сериализует ключ, удаляет соответствующий Redis-ключ и исключает его из множества {@code keysSetKey}.
+     * Возвращает предыдущее значение, если оно существовало, иначе {@code null}. Логирует удаление и задержку.</p>
+     *
+     * @param key ключ, по которому производится удаление
+     * @return предыдущее значение, если оно было, иначе {@code null}
+     * @throws RuntimeException если операция Redis завершилась ошибкой
+     */
     @Override
     public V remove(Object key) {
         @SuppressWarnings("unchecked")
@@ -288,6 +439,15 @@ public class RedisWrapperMap<K, V> implements Map<K, V>, AutoCloseable {
         }
     }
 
+    /**
+     * Добавляет все пары ключ-значение из переданной {@code Map<K, V>} в хранилище.
+     *
+     * <p>Сериализует каждый ключ и значение, сохраняет их в Redis и добавляет ключи в {@code keysSetKey}.
+     * Использует Pipeline для оптимизации операций. Логирует количество записей и задержку.</p>
+     *
+     * @param another карта с данными для добавления
+     * @throws RuntimeException если операция Redis завершилась ошибкой
+     */
     @Override
     public void putAll(Map<? extends K, ? extends V> another) {
         if (another.isEmpty()) {
@@ -314,6 +474,16 @@ public class RedisWrapperMap<K, V> implements Map<K, V>, AutoCloseable {
         }
     }
 
+    /**
+     * Очищает хранилище, удаляя все ключи и связанные значения.
+     *
+     * <p>Удаляет все Redis-ключи, соответствующие сериализованным ключам,
+     * и само множество {@code keysSetKey}.
+     * Использует Pipeline для пакетного удаления.
+     * Логирует количество операций и задержку.</p>
+     *
+     * @throws RuntimeException если операция Redis завершилась ошибкой
+     */
     @Override
     public void clear() {
         long t0 = System.nanoTime();
@@ -341,6 +511,15 @@ public class RedisWrapperMap<K, V> implements Map<K, V>, AutoCloseable {
         }
     }
 
+    /**
+     * Возвращает множество всех ключей, присутствующих в хранилище.
+     *
+     * <p>Десериализует все элементы множества {@code keysSetKey}
+     * и возвращает их как {@code Set<K>}.</p>
+     *
+     * @return неизменяемое множество ключей
+     * @throws RuntimeException если операция Redis завершилась ошибкой
+     */
     @Override
     public Set<K> keySet() {
         long t0 = System.nanoTime();
@@ -362,6 +541,14 @@ public class RedisWrapperMap<K, V> implements Map<K, V>, AutoCloseable {
         }
     }
 
+    /**
+     * Возвращает коллекцию всех значений, хранящихся в Redis.
+     *
+     * <p>Получает все значения по ключам из {@code keysSetKey}, десериализует их и возвращает как {@code List<V>}.</p>
+     *
+     * @return неизменяемая коллекция значений
+     * @throws RuntimeException если операция Redis завершилась ошибкой
+     */
     @Override
     public Collection<V> values() {
         long t0 = System.nanoTime();
@@ -400,6 +587,15 @@ public class RedisWrapperMap<K, V> implements Map<K, V>, AutoCloseable {
         }
     }
 
+    /**
+     * Возвращает множество всех пар ключ-значение, хранящихся в Redis.
+     *
+     * <p>Получает все значения по ключам из {@code keysSetKey},
+     * десериализует их и возвращает как {@code Set<Entry<K, V>>}.</p>
+     *
+     * @return неизменяемое множество пар ключ-значение
+     * @throws RuntimeException если операция Redis завершилась ошибкой
+     */
     @Override
     public Set<Entry<K, V>> entrySet() {
         long t0 = System.nanoTime();
