@@ -11,12 +11,7 @@ import redis.clients.jedis.Pipeline;
 import redis.clients.jedis.Response;
 
 import java.io.IOException;
-import java.util.ArrayList;
-import java.util.Collection;
-import java.util.List;
-import java.util.Map;
-import java.util.Objects;
-import java.util.Set;
+import java.util.*;
 
 public class RedisWrapperMap<K, V> implements Map<K, V>, AutoCloseable {
     private static final Logger LOG = LoggerFactory.getLogger(RedisWrapperMap.class);
@@ -318,16 +313,96 @@ public class RedisWrapperMap<K, V> implements Map<K, V>, AutoCloseable {
 
     @Override
     public Set<K> keySet() {
-        return Set.of();
+        long t0 = System.nanoTime();
+        try (Jedis jedis = jedisPool.getResource()) {
+            Set<String> ssk = jedis.smembers(keysSetKey);
+            Set<K> result = new HashSet<>(ssk.size());
+            for (String sk : ssk) {
+                K k = deserializeKey(sk);
+                result.add(k);
+            }
+            LOG.info("KeySet: size={}, keysSetKey='{}'", result.size(), keysSetKey);
+            LOG.debug("KeySet latencyMicros={}", (System.nanoTime() - t0) / 1_000);
+
+            return Collections.unmodifiableSet(result);
+
+        } catch (Exception e) {
+            LOG.error("KeySet failed: keysSetKey='{}'", keysSetKey, e);
+            throw e;
+        }
     }
 
     @Override
     public Collection<V> values() {
-        return List.of();
+        long t0 = System.nanoTime();
+        try (Jedis jedis = jedisPool.getResource()) {
+            Set<String> ssk = jedis.smembers(keysSetKey);
+            if (ssk.isEmpty()) {
+                LOG.info("Values: empty -> []");
+                return Collections.emptyList();
+            }
+            Pipeline pipeline = jedis.pipelined();
+            List<Response<String>> responses = new ArrayList<>(ssk.size());
+            for (String sk : ssk) {
+                responses.add(pipeline.get(keyForRedisString(sk)));
+            }
+            pipeline.sync();
+            List<V> values = new ArrayList<>(responses.size());
+            int nullCount = 0;
+            for (Response<String> r : responses) {
+                String json = r.get();
+                if (json == null) {
+                    nullCount++;
+                    values.add(null);
+                } else {
+                    V value = deserializeValue(json);
+                    values.add(value);
+                }
+            }
+            LOG.info("Values: count={}, nulls={}, latencyMicros={}",
+                    values.size(),
+                    nullCount,
+                    (System.nanoTime() - t0) / 1_000);
+            return Collections.unmodifiableList(values);
+        } catch (Exception e) {
+            LOG.error("Values failed", e);
+            throw e;
+        }
     }
 
     @Override
     public Set<Entry<K, V>> entrySet() {
-        return Set.of();
+        long t0 = System.nanoTime();
+        try (Jedis jedis = jedisPool.getResource()) {
+            Set<String> allKeys = jedis.smembers(keysSetKey);
+            Set<Entry<K, V>> entries = new HashSet<>(allKeys.size());
+            if (!allKeys.isEmpty()) {
+                Pipeline pipeline = jedis.pipelined();
+                Map<String, Response<String>> respMap = new LinkedHashMap<>();
+                for (String key : allKeys) {
+                    respMap.put(key, pipeline.get(keyForRedisString(key)));
+                }
+                pipeline.sync();
+                int nullVals = 0;
+                for (Map.Entry<String, Response<String>> e : respMap.entrySet()) {
+                    String sk = e.getKey();
+                    String jsonVal = e.getValue().get();
+                    K k = deserializeKey(sk);
+                    V v = jsonVal == null ? null : deserializeValue(jsonVal);
+                    if (v == null) nullVals++;
+                    entries.add(new AbstractMap.SimpleImmutableEntry<>(k, v));
+                }
+                LOG.info("EntrySet: size={}, nullValues={}, latencyMicros={}",
+                        entries.size(),
+                        nullVals,
+                        (System.nanoTime() - t0) / 1_000);
+            } else {
+                LOG.info("EntrySet: empty");
+            }
+            return Collections.unmodifiableSet(entries);
+        } catch (Exception e) {
+            LOG.error("EntrySet failed: keysSetKey='{}'", keysSetKey, e);
+            throw e;
+        }
     }
 }
