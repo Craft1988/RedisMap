@@ -8,9 +8,15 @@ import org.slf4j.LoggerFactory;
 import redis.clients.jedis.Jedis;
 import redis.clients.jedis.JedisPool;
 import redis.clients.jedis.Pipeline;
+import redis.clients.jedis.Response;
 
 import java.io.IOException;
-import java.util.*;
+import java.util.ArrayList;
+import java.util.Collection;
+import java.util.List;
+import java.util.Map;
+import java.util.Objects;
+import java.util.Set;
 
 public class RedisWrapperMap<K, V> implements Map<K, V>, AutoCloseable {
     private static final Logger LOG = LoggerFactory.getLogger(RedisWrapperMap.class);
@@ -113,27 +119,86 @@ public class RedisWrapperMap<K, V> implements Map<K, V>, AutoCloseable {
 
     @Override
     public void close() throws Exception {
-
+        LOG.info("Closing JedisPool for prefix='{}'", prefix);
+        jedisPool.close();
+        LOG.info("JedisPool closed for prefix='{}'", prefix);
     }
 
     @Override
     public int size() {
-        return 0;
+        long t0 = System.nanoTime();
+        try (Jedis jedis = jedisPool.getResource()) {
+            Long result = jedis.scard(keysSetKey);
+            int size = result.intValue();
+            LOG.info("Size: keysSetKey='{}' -> {}", keysSetKey, size);
+            LOG.debug("Size latencyMicros={}", (System.nanoTime() - t0) / 1_000);
+            return size;
+        } catch (Exception e) {
+            LOG.error("Size check failed: keysSetKey='{}'", keysSetKey, e);
+            throw e;
+        }
     }
 
     @Override
     public boolean isEmpty() {
-        return false;
+        boolean empty = size() == 0;
+        LOG.debug("IsEmpty: {}", empty);
+        return empty;
     }
 
     @Override
-    public boolean containsKey(Object o) {
-        return false;
+    public boolean containsKey(Object key) {
+        @SuppressWarnings("unchecked")
+        String serializedKey = serializeKey((K) key);
+        long t0 = System.nanoTime();
+        try (Jedis jedis = jedisPool.getResource()) {
+            boolean result = jedis.sismember(keysSetKey, serializedKey);
+            LOG.info("ContainsKey: key='{}' (serialized='{}') -> {}", LogHelper.safeToString(key), serializedKey, result);
+            LOG.debug("ContainsKey latencyMicros={}", (System.nanoTime() - t0) / 1_000);
+            return result;
+        } catch (Exception e) {
+            LOG.error("ContainsKey failed: key='{}'", LogHelper.safeToString(key), e);
+            throw e;
+        }
     }
 
     @Override
-    public boolean containsValue(Object o) {
-        return false;
+    public boolean containsValue(Object value) {
+        @SuppressWarnings("unchecked")
+        String serializedValue = serializeValue((V) value);
+        long t0 = System.nanoTime();
+        try (Jedis jedis = jedisPool.getResource()) {
+            Set<String> allKeys = jedis.smembers(keysSetKey);
+            LOG.debug("ContainsValue: keysSet size={}", allKeys.size());
+            if (allKeys.isEmpty()) {
+                LOG.info("ContainsValue: empty keysSet -> false");
+                return false;
+            }
+            Pipeline pipeline = jedis.pipelined();
+            List<Response<String>> responses = new ArrayList<>(allKeys.size());
+            for (String key : allKeys) {
+                responses.add(pipeline.get(keyForRedisString(key)));
+            }
+            pipeline.sync();
+            int matchedIndex = -1;
+            for (int i = 0; i < responses.size(); i++) {
+                Response<String> response = responses.get(i);
+                String stored = response.get();
+                if (Objects.equals(stored, serializedValue)) {
+                    matchedIndex = i;
+                    break;
+                }
+            }
+            boolean found = matchedIndex >= 0;
+            LOG.info("ContainsValue: found={} (keysQueried={}, latencyMicros={})",
+                    found,
+                    responses.size(),
+                    (System.nanoTime() - t0) / 1_000);
+            return found;
+        } catch (Exception e) {
+            LOG.error("ContainsValue failed: value='{}'", LogHelper.safeToString(value), e);
+            throw e;
+        }
     }
 
     @Override
